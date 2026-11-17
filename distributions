@@ -1,0 +1,3 @@
+# codename  container image (the build runs in it)
+resolute ubuntu:26.04
+trixie debian:trixie

@@ -1,0 +1,148 @@
+name: Build and release
+
+# Rebuilds the distributions' modemmanager with patches/ and publishes one
+# GitHub release per distribution release codename. A release is built once:
+# a new release follows a new distribution source version (checked daily)
+# or a bump of REVISION (needed for any change to patches/ or build.sh).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '41 4 * * *'
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      releases: ${{ steps.plan.outputs.releases }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REVISION=$(cat REVISION)
+          builds='[]'
+          releases='[]'
+          while read -r codename image; do
+            src=$(docker run --rm "$image" bash -c "
+              sed -i 's/^Types: deb\$/Types: deb deb-src/' /etc/apt/sources.list.d/*.sources
+              apt-get update -qq >/dev/null && apt-cache showsrc modemmanager" |
+              awk '/^Version:/ { print $2 }' | sort -V | tail -1)
+            [ -n "$src" ] || { echo "::error::no modemmanager source for $codename"; exit 1; }
+            version="$src+citronics$REVISION"
+            tag="$codename-$version"
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "$tag: already released"
+              continue
+            fi
+            echo "$tag: to build"
+            releases=$(jq -c --arg c "$codename" --arg v "$version" --arg t "$tag" \
+              '. + [{codename: $c, version: $v, tag: $t}]' <<< "$releases")
+            for arch in armhf arm64; do
+              builds=$(jq -c --arg c "$codename" --arg i "$image" --arg a "$arch" \
+                '. + [{codename: $c, image: $i, arch: $a}]' <<< "$builds")
+            done
+          done < <(grep -v "^#" distributions)
+          echo "matrix=$builds" >> "$GITHUB_OUTPUT"
+          echo "releases=$releases" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    # arm64 builds natively; armhf runs under QEMU (the arm64 runners
+    # cannot execute 32-bit code).
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v6
+      - if: matrix.arch == 'armhf'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+      - name: Build
+        run: |
+          platform=linux/arm64
+          [ "${{ matrix.arch }}" = armhf ] && platform=linux/arm/v7
+          docker run --rm --platform "$platform" -v "$PWD:/work" "${{ matrix.image }}" /work/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ matrix.codename }}-${{ matrix.arch }}
+          # Debug symbols and the architecture-independent documentation
+          # are not published.
+          path: |
+            out/${{ matrix.codename }}/*.deb
+            !out/${{ matrix.codename }}/*-dbgsym_*
+            !out/${{ matrix.codename }}/*_all.deb
+
+  release:
+    needs: [plan, build]
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.releases) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: debs-${{ matrix.codename }}-*
+          merge-multiple: true
+          path: debs
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls debs/*.deb
+          # deb-packages publishes each file in the suite named here
+          for f in debs/*.deb; do
+            printf '%s\t%s\n' "$(basename "$f")" "${{ matrix.codename }}"
+          done > suites.tsv
+          gh release create "${{ matrix.tag }}" --target "$GITHUB_SHA" \
+            --title "ModemManager ${{ matrix.version }} (${{ matrix.codename }})" \
+            --notes "modemmanager ${{ matrix.version }} for ${{ matrix.codename }} (armhf, arm64), with: $(ls patches | sed 's/^[0-9]*-//; s/\.patch$//' | paste -sd, | sed 's/,/, /g')." \
+            debs/*.deb suites.tsv
+          # Only the newest release of a codename stays published
+          gh release list --limit 1000 --json tagName --jq '.[].tagName' |
+            grep "^${{ matrix.codename }}-" | grep -vxF "${{ matrix.tag }}" |
+            while read -r old; do
+              echo "Deleting superseded release $old"
+              gh release delete "$old" --yes --cleanup-tag
+            done
+
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger the APT repository update
+        env:
+          APT_DISPATCH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
+        run: |
+          # deb-packages also rebuilds its index daily: without the token the
+          # packages reach apt within a day.
+          if [ -z "$APT_DISPATCH_TOKEN" ]; then
+            echo "::warning::APT_DISPATCH_TOKEN is not set: deb-packages picks the release up at its next daily run."
+            exit 0
+          fi
+          code=$(curl -s -o /tmp/dispatch.out -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $APT_DISPATCH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Citronics/deb-packages/dispatches \
+            -d '{"event_type":"update-repo"}')
+          if [ "$code" != 204 ]; then
+            echo "::error::deb-packages refused the update request (HTTP $code): $(cat /tmp/dispatch.out)"
+            exit 1
+          fi
