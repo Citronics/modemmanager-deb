@@ -78,7 +78,11 @@ jobs:
         run: |
           platform=linux/arm64
           [ "${{ matrix.arch }}" = armhf ] && platform=linux/arm/v7
-          docker run --rm --platform "$platform" -v "$PWD:/work" "${{ matrix.image }}" /work/build.sh
+          # The build tree is on a tmpfs: on the runner's disk, inode numbers
+          # overflow 32-bit tools under QEMU (chmod: Value too large for
+          # defined data type)
+          docker run --rm --platform "$platform" --tmpfs /tmp:exec,size=12g \
+            -v "$PWD:/work" "${{ matrix.image }}" /work/build.sh
       - uses: actions/upload-artifact@v4
         with:
           name: debs-${{ matrix.codename }}-${{ matrix.arch }}
